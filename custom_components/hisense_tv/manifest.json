@@ -1,16 +1,9 @@
 {
   "domain": "hisense_tv",
   "name": "Hisense TV MQTT Bridge",
-  "version": "23.05.11_2",
+  "version": "24.02.0",
   "documentation": "https://github.com/azmodan2k/ha_hisense_tv",
-  "dependencies": [
-    "mqtt"
-  ],
-  "codeowners": [
-    "@azmodan2k"
-  ],
-  "requirements": [
-    "wakeonlan==2.0.1"
-  ],
+  "codeowners": ["@azmodan2k"],
+  "requirements": ["paho-mqtt>=2.0.0", "wakeonlan==2.0.1"],
   "config_flow": true
 }

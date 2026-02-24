@@ -7,29 +7,16 @@ import logging
 import voluptuous as vol
 import wakeonlan
 
-from homeassistant.components import mqtt
 from homeassistant.components.media_player import (
-    DEVICE_CLASS_TV,
-    PLATFORM_SCHEMA,
     BrowseMedia,
+    MediaPlayerDeviceClass,
     MediaPlayerEntity,
+    PLATFORM_SCHEMA,
 )
 from homeassistant.components.media_player.const import (
-    MEDIA_CLASS_APP,
-    MEDIA_CLASS_CHANNEL,
-    MEDIA_CLASS_DIRECTORY,
-    MEDIA_TYPE_APP,
-    MEDIA_TYPE_APPS,
-    MEDIA_TYPE_CHANNEL,
-    MEDIA_TYPE_TVSHOW,
-    SUPPORT_BROWSE_MEDIA,
-    SUPPORT_PLAY_MEDIA,
-    SUPPORT_SELECT_SOURCE,
-    SUPPORT_TURN_OFF,
-    SUPPORT_TURN_ON,
-    SUPPORT_VOLUME_MUTE,
-    SUPPORT_VOLUME_SET,
-    SUPPORT_VOLUME_STEP,
+    MediaClass,
+    MediaPlayerEntityFeature,
+    MediaType,
 )
 from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
@@ -43,6 +30,14 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import (
     ATTR_CODE,
+    CONF_MQTT_CLIENT_ID,
+    CONF_MQTT_PASSWORD,
+    CONF_MQTT_PORT,
+    CONF_MQTT_USERNAME,
+    DEFAULT_CLIENT_ID,
+    DEFAULT_MQTT_PASSWORD,
+    DEFAULT_MQTT_PORT,
+    DEFAULT_MQTT_USERNAME,
     DEFAULT_NAME,
     DOMAIN,
 )
@@ -82,7 +77,11 @@ async def async_setup_platform(hass, config, async_add_devices, discovery_info=N
     entry_data = {
         CONF_NAME: config[CONF_NAME],
         CONF_MAC: config[CONF_MAC],
-        CONF_IP_ADDRESS: config.get(CONF_IP_ADDRESS, wakeonlan.BROADCAST_IP)
+        CONF_IP_ADDRESS: config.get(CONF_IP_ADDRESS, wakeonlan.BROADCAST_IP),
+        CONF_MQTT_PORT: DEFAULT_MQTT_PORT,
+        CONF_MQTT_USERNAME: DEFAULT_MQTT_USERNAME,
+        CONF_MQTT_PASSWORD: DEFAULT_MQTT_PASSWORD,
+        CONF_MQTT_CLIENT_ID: DEFAULT_CLIENT_ID,
     }
 
     hass.async_create_task(
@@ -96,9 +95,16 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up the media player entry."""
     _LOGGER.debug("async_setup_entry config: %s", config_entry.data)
 
+    domain_data = hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {})
+    mqtt_client = domain_data.get("mqtt_client")
+    if not mqtt_client:
+        _LOGGER.error("MQTT client not available")
+        return
+
     name = config_entry.data[CONF_NAME]
     mac = config_entry.data[CONF_MAC]
     ip_address = config_entry.data.get(CONF_IP_ADDRESS, wakeonlan.BROADCAST_IP)
+    client_id = config_entry.data.get(CONF_MQTT_CLIENT_ID, DEFAULT_CLIENT_ID)
     uid = config_entry.unique_id
     if uid is None:
         uid = config_entry.entry_id
@@ -109,6 +115,8 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         mac=mac,
         uid=uid,
         ip_address=ip_address,
+        mqtt_client=mqtt_client,
+        client_id=client_id,
     )
     async_add_entities([entity])
 
@@ -123,6 +131,8 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         mac: str,
         uid: str,
         ip_address: str,
+        mqtt_client,
+        client_id: str = DEFAULT_CLIENT_ID,
     ):
         HisenseTvBase.__init__(
             self=self,
@@ -131,6 +141,8 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
             mac=mac,
             uid=uid,
             ip_address=ip_address,
+            mqtt_client=mqtt_client,
+            client_id=client_id,
         )
 
         self._muted = False
@@ -147,21 +159,20 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
 
     @property
     def should_poll(self):
-        """No polling needed."""
-        return False
+        """Enable polling to request state periodically."""
+        return True
 
     @property
     def media_content_type(self):
         """Content type of current playing media."""
         _LOGGER.debug("media_content_type")
-        # return MEDIA_TYPE_CHANNEL
-        return MEDIA_TYPE_TVSHOW
+        return MediaType.TVSHOW
 
     @property
     def device_class(self):
         """Set the device class to TV."""
         _LOGGER.debug("device_class")
-        return DEVICE_CLASS_TV
+        return MediaPlayerDeviceClass.TV
 
     @property
     def name(self):
@@ -176,20 +187,20 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         """Flag media player features that are supported."""
         _LOGGER.debug("supported_features")
         return (
-            SUPPORT_SELECT_SOURCE
-            | SUPPORT_TURN_ON
-            | SUPPORT_TURN_OFF
-            | SUPPORT_VOLUME_MUTE
-            | SUPPORT_VOLUME_STEP
-            | SUPPORT_VOLUME_SET
-            | SUPPORT_BROWSE_MEDIA
-            | SUPPORT_PLAY_MEDIA
+            MediaPlayerEntityFeature.SELECT_SOURCE
+            | MediaPlayerEntityFeature.TURN_ON
+            | MediaPlayerEntityFeature.TURN_OFF
+            | MediaPlayerEntityFeature.VOLUME_MUTE
+            | MediaPlayerEntityFeature.VOLUME_STEP
+            | MediaPlayerEntityFeature.VOLUME_SET
+            | MediaPlayerEntityFeature.BROWSE_MEDIA
+            | MediaPlayerEntityFeature.PLAY_MEDIA
         )
 
     @property
     def unique_id(self):
-        """Return the unique id of the device."""
-        return self._unique_id
+        """Return the unique id of the entity."""
+        return f"{self._unique_id}_media_player"
 
     @property
     def device_info(self):
@@ -218,8 +229,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
     async def async_turn_off(self, **kwargs):
         """Turn off media player."""
         _LOGGER.debug("turn_off")
-        await mqtt.async_publish(
-            hass=self._hass,
+        await self._mqtt_client.async_publish(
             topic=self._out_topic("/remoteapp/tv/remote_service/%s/actions/sendkey"),
             payload="KEY_POWER",
             retain=False,
@@ -241,8 +251,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         """Set volume level, range 0..1."""
         _LOGGER.debug("set_volume_level %s", volume)
         self._volume = int(volume * 100)
-        await mqtt.async_publish(
-            hass=self._hass,
+        await self._mqtt_client.async_publish(
             topic=self._out_topic(
                 "/remoteapp/tv/platform_service/%s/actions/changevolume"
             ),
@@ -254,8 +263,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         _LOGGER.debug("volume_up")
         if self._volume < 100:
             self._volume = self._volume + 1
-        await mqtt.async_publish(
-            hass=self._hass,
+        await self._mqtt_client.async_publish(
             topic=self._out_topic("/remoteapp/tv/remote_service/%s/actions/sendkey"),
             payload="KEY_VOLUMEUP",
         )
@@ -265,8 +273,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         _LOGGER.debug("volume_down")
         if self._volume > 0:
             self._volume = self._volume - 1
-        await mqtt.async_publish(
-            hass=self._hass,
+        await self._mqtt_client.async_publish(
             topic=self._out_topic("/remoteapp/tv/remote_service/%s/actions/sendkey"),
             payload="KEY_VOLUMEDOWN",
         )
@@ -275,8 +282,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         """Send mute command."""
         _LOGGER.debug("mute_volume %s", mute)
         self._muted = mute
-        await mqtt.async_publish(
-            hass=self._hass,
+        await self._mqtt_client.async_publish(
             topic=self._out_topic("/remoteapp/tv/remote_service/%s/actions/sendkey"),
             payload="KEY_MUTE",
         )
@@ -287,8 +293,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         _LOGGER.debug("source_list")
         if len(self._source_list) <= 1:
             self._hass.async_create_task(
-                mqtt.async_publish(
-                    hass=self._hass,
+                self._mqtt_client.async_publish(
                     topic=self._out_topic(
                         "/remoteapp/tv/ui_service/%s/actions/sourcelist"
                     ),
@@ -330,8 +335,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         _LOGGER.debug("async_select_source %s", source)
 
         if source == "App":
-            await mqtt.async_publish(
-                hass=self._hass,
+            await self._mqtt_client.async_publish(
                 topic=self._out_topic(
                     "/remoteapp/tv/remote_service/%s/actions/sendkey"
                 ),
@@ -346,8 +350,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
                 "sourcename": source_dic.get("sourcename"),
             }
         )
-        await mqtt.async_publish(
-            hass=self._hass,
+        await self._mqtt_client.async_publish(
             topic=self._out_topic("/remoteapp/tv/ui_service/%s/actions/changesource"),
             payload=payload,
         )
@@ -356,35 +359,51 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         for unsubscribe in list(self._subscriptions.values()):
             unsubscribe()
 
+    async def _request_state(self):
+        """Request TV state via MQTT (gettvstate and sourcelist)."""
+        await self._mqtt_client.async_publish(
+            topic=self._out_topic("/remoteapp/tv/ui_service/%s/actions/gettvstate"),
+            payload="",
+            retain=False,
+        )
+        await self._mqtt_client.async_publish(
+            topic=self._out_topic("/remoteapp/tv/ui_service/%s/actions/sourcelist"),
+            payload="",
+            retain=False,
+        )
+
+    async def async_update(self):
+        """Poll TV state periodically."""
+        await self._request_state()
+
     async def async_added_to_hass(self):
         """Subscribe to MQTT events."""
-        self._subscriptions["tvsleep"] = await mqtt.async_subscribe(
-            self._hass,
-            self._in_topic(
+        self._subscriptions["tvsleep"] = await self._mqtt_client.async_subscribe(
+            topic=self._in_topic(
                 "/remoteapp/mobile/broadcast/platform_service/actions/tvsleep"
             ),
-            self._message_received_turnoff,
+            callback=self._message_received_turnoff,
         )
 
-        self._subscriptions["state"] = await mqtt.async_subscribe(
-            self._hass,
-            self._in_topic("/remoteapp/mobile/broadcast/ui_service/state"),
-            self._message_received_state,
+        self._subscriptions["state"] = await self._mqtt_client.async_subscribe(
+            topic=self._in_topic("/remoteapp/mobile/broadcast/ui_service/state"),
+            callback=self._message_received_state,
         )
 
-        self._subscriptions["volume"] = await mqtt.async_subscribe(
-            self._hass,
-            self._in_topic(
+        self._subscriptions["volume"] = await self._mqtt_client.async_subscribe(
+            topic=self._in_topic(
                 "/remoteapp/mobile/broadcast/platform_service/actions/volumechange"
             ),
-            self._message_received_volume,
+            callback=self._message_received_volume,
         )
 
-        self._subscriptions["sourcelist"] = await mqtt.async_subscribe(
-            self._hass,
-            self._out_topic("/remoteapp/mobile/%s/ui_service/data/sourcelist"),
-            self._message_received_sourcelist,
+        self._subscriptions["sourcelist"] = await self._mqtt_client.async_subscribe(
+            topic=self._out_topic("/remoteapp/mobile/%s/ui_service/data/sourcelist"),
+            callback=self._message_received_sourcelist,
         )
+
+        # Request initial state on startup
+        await self._request_state()
 
     async def _message_received_turnoff(self, msg):
         """Run when new MQTT message has been received."""
@@ -438,15 +457,13 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         _LOGGER.debug("message_received_state %s", statetype)
 
         if self._state == STATE_OFF:
-            await mqtt.async_publish(
-                hass=self._hass,
+            await self._mqtt_client.async_publish(
                 topic=self._out_topic(
                     "/remoteapp/tv/platform_service/%s/actions/getvolume"
                 ),
                 payload="",
             )
-            await mqtt.async_publish(
-                hass=self._hass,
+            await self._mqtt_client.async_publish(
                 topic=self._out_topic("/remoteapp/tv/ui_service/%s/actions/sourcelist"),
                 payload="",
             )
@@ -496,7 +513,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
     async def _build_library_node(self):
         node = BrowseMedia(
             title="Media Library",
-            media_class=MEDIA_CLASS_DIRECTORY,
+            media_class=MediaClass.DIRECTORY,
             media_content_type="library",
             media_content_id="library",
             can_play=False,
@@ -505,7 +522,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         )
 
         stream_get, unsubscribe_getchannellistinfo = await mqtt_pub_sub(
-            hass=self._hass,
+            self._mqtt_client,
             pub=self._out_topic(
                 "/remoteapp/tv/platform_service/%s/actions/getchannellistinfo"
             ),
@@ -529,7 +546,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
                         node.children.append(
                             BrowseMedia(
                                 title=item.get("list_name"),
-                                media_class=MEDIA_CLASS_DIRECTORY,
+                                media_class=MediaClass.DIRECTORY,
                                 media_content_type="channellistinfo",
                                 media_content_id=key,
                                 can_play=False,
@@ -549,8 +566,8 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         node.children.append(
             BrowseMedia(
                 title="Applications",
-                media_class=MEDIA_CLASS_APP,
-                media_content_type=MEDIA_TYPE_APPS,
+                media_class=MediaClass.APP,
+                media_content_type=MediaType.APPS,
                 media_content_id="app_list",
                 can_play=False,
                 can_expand=True,
@@ -561,8 +578,8 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
     async def _build_app_list_node(self):
         node = BrowseMedia(
             title="Applications",
-            media_class=MEDIA_CLASS_APP,
-            media_content_type=MEDIA_TYPE_APPS,
+            media_class=MediaClass.APP,
+            media_content_type=MediaType.APPS,
             media_content_id="app_list",
             can_play=False,
             can_expand=True,
@@ -570,7 +587,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         )
 
         stream_get, unsubscribe_applist = await mqtt_pub_sub(
-            hass=self._hass,
+            self._mqtt_client,
             pub=self._out_topic("/remoteapp/tv/ui_service/%s/actions/applist"),
             sub=self._in_topic("/remoteapp/mobile/%s/ui_service/data/applist"),
         )
@@ -588,8 +605,8 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
                         node.children.append(
                             BrowseMedia(
                                 title=item.get("name"),
-                                media_class=MEDIA_CLASS_APP,
-                                media_content_type=MEDIA_TYPE_APP,
+                                media_class=MediaClass.APP,
+                                media_content_type=MediaType.APP,
                                 media_content_id=nid,
                                 can_play=True,
                                 can_expand=False,
@@ -618,7 +635,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         list_name = self._channel_infos.get(media_content_id).get("list_name")
         node = BrowseMedia(
             title=list_name,
-            media_class=MEDIA_CLASS_DIRECTORY,
+            media_class=MediaClass.DIRECTORY,
             media_content_type="channellistinfo",
             media_content_id=media_content_id,
             can_play=False,
@@ -630,7 +647,7 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
             {"list_para": media_content_id, "list_name": list_name}
         )
         stream_get, unsubscribe_channellist = await mqtt_pub_sub(
-            hass=self._hass,
+            self._mqtt_client,
             pub=self._out_topic(
                 "/remoteapp/tv/platform_service/%s/actions/channellist"
             ),
@@ -652,8 +669,8 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
                         node.children.append(
                             BrowseMedia(
                                 title=item.get("channel_name"),
-                                media_class=MEDIA_CLASS_CHANNEL,
-                                media_content_type=MEDIA_TYPE_CHANNEL,
+                                media_class=MediaClass.CHANNEL,
+                                media_content_type=MediaType.CHANNEL,
                                 media_content_id=item.get("channel_param"),
                                 can_play=True,
                                 can_expand=False,
@@ -674,22 +691,20 @@ class HisenseTvEntity(MediaPlayerEntity, HisenseTvBase):
         """Send the play_media command to the media player."""
         _LOGGER.debug("async_play_media %s\n%s", media_id, kwargs)
 
-        if media_type == MEDIA_TYPE_CHANNEL:
+        if media_type == MediaType.CHANNEL:
             channel = json.dumps({"channel_param": media_id})
-            await mqtt.async_publish(
-                hass=self._hass,
+            await self._mqtt_client.async_publish(
                 topic=self._out_topic(
                     "/remoteapp/tv/ui_service/%s/actions/changechannel"
                 ),
                 payload=channel,
             )
-        elif media_type == MEDIA_CLASS_APP:
+        elif media_type == MediaType.APP:
             app = self._app_list.get(media_id)
             payload = json.dumps(
                 {"appId": media_id, "name": app.get("name"), "url": app.get("url")}
             )
-            await mqtt.async_publish(
-                hass=self._hass,
+            await self._mqtt_client.async_publish(
                 topic=self._out_topic("/remoteapp/tv/ui_service/%s/actions/launchapp"),
                 payload=payload,
             )

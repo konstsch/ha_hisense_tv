@@ -5,12 +5,11 @@ from json.decoder import JSONDecodeError
 import logging
 from wakeonlan import BROADCAST_IP
 
-from homeassistant.components import mqtt
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import CONF_IP_ADDRESS, CONF_MAC, CONF_NAME
 from homeassistant.util import dt as dt_util
 
-from .const import DEFAULT_NAME, DOMAIN
+from .const import CONF_MQTT_CLIENT_ID, DEFAULT_CLIENT_ID, DEFAULT_NAME, DOMAIN
 from .helper import HisenseTvBase
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,9 +19,16 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up MQTT sensors dynamically through MQTT discovery."""
     _LOGGER.debug("async_setup_entry config: %s", config_entry.data)
 
+    domain_data = hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {})
+    mqtt_client = domain_data.get("mqtt_client")
+    if not mqtt_client:
+        _LOGGER.error("MQTT client not available")
+        return
+
     name = config_entry.data[CONF_NAME]
     mac = config_entry.data[CONF_MAC]
     ip_address = config_entry.data.get(CONF_IP_ADDRESS, BROADCAST_IP)
+    client_id = config_entry.data.get(CONF_MQTT_CLIENT_ID, DEFAULT_CLIENT_ID)
     uid = config_entry.unique_id
     if uid is None:
         uid = config_entry.entry_id
@@ -33,6 +39,8 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         mac=mac,
         uid=uid,
         ip_address=ip_address,
+        mqtt_client=mqtt_client,
+        client_id=client_id,
     )
     async_add_entities([entity])
 
@@ -40,7 +48,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 class HisenseTvSensor(SensorEntity, HisenseTvBase):
     """Representation of a sensor that can be updated using MQTT."""
 
-    def __init__(self, hass, name, mac, uid, ip_address):
+    def __init__(self, hass, name, mac, uid, ip_address, mqtt_client, client_id=DEFAULT_CLIENT_ID):
         HisenseTvBase.__init__(
             self=self,
             hass=hass,
@@ -48,6 +56,8 @@ class HisenseTvSensor(SensorEntity, HisenseTvBase):
             mac=mac,
             uid=uid,
             ip_address=ip_address,
+            mqtt_client=mqtt_client,
+            client_id=client_id,
         )
         self._is_available = False
         self._state = {}
@@ -59,32 +69,28 @@ class HisenseTvSensor(SensorEntity, HisenseTvBase):
             unsubscribe()
 
     async def async_added_to_hass(self):
-        self._subscriptions["tvsleep"] = await mqtt.async_subscribe(
-            self._hass,
-            self._in_topic(
+        self._subscriptions["tvsleep"] = await self._mqtt_client.async_subscribe(
+            topic=self._in_topic(
                 "/remoteapp/mobile/broadcast/platform_service/actions/tvsleep"
             ),
-            self._message_received_turnoff,
+            callback=self._message_received_turnoff,
         )
 
-        self._subscriptions["state"] = await mqtt.async_subscribe(
-            self._hass,
-            self._in_topic("/remoteapp/mobile/broadcast/ui_service/state"),
-            self._message_received_turnon,
+        self._subscriptions["state"] = await self._mqtt_client.async_subscribe(
+            topic=self._in_topic("/remoteapp/mobile/broadcast/ui_service/state"),
+            callback=self._message_received_turnon,
         )
 
-        self._subscriptions["picturesettings"] = await mqtt.async_subscribe(
-            self._hass,
-            self._in_topic("/remoteapp/mobile/%s/platform_service/data/picturesetting"),
-            self._message_received,
+        self._subscriptions["picturesettings"] = await self._mqtt_client.async_subscribe(
+            topic=self._in_topic("/remoteapp/mobile/%s/platform_service/data/picturesetting"),
+            callback=self._message_received,
         )
 
-        self._subscriptions["picturesettings_value"] = await mqtt.async_subscribe(
-            self._hass,
-            self._in_topic(
+        self._subscriptions["picturesettings_value"] = await self._mqtt_client.async_subscribe(
+            topic=self._in_topic(
                 "/remoteapp/mobile/broadcast/platform_service/data/picturesetting"
             ),
-            self._message_received_value,
+            callback=self._message_received_value,
         )
 
     async def _message_received_turnoff(self, msg):
@@ -171,8 +177,7 @@ class HisenseTvSensor(SensorEntity, HisenseTvBase):
         self._force_trigger = False
         self._last_trigger = dt_util.utcnow()
 
-        await mqtt.async_publish(
-            hass=self._hass,
+        await self._mqtt_client.async_publish(
             topic=self._out_topic(
                 "/remoteapp/tv/platform_service/%s/actions/picturesetting"
             ),
@@ -190,5 +195,5 @@ class HisenseTvSensor(SensorEntity, HisenseTvBase):
 
     @property
     def unique_id(self):
-        """Return the unique id of the device."""
-        return self._unique_id
+        """Return the unique id of the entity."""
+        return f"{self._unique_id}_sensor"
